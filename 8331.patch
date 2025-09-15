@@ -1,0 +1,482 @@
+From c5d7402d836ad0ae6404dd50b3cb7b5b07cce026 Mon Sep 17 00:00:00 2001
+From: Alexander Efimov <Alexandr.Efimov@gmail.com>
+Date: Fri, 12 Sep 2025 17:49:06 +0500
+Subject: [PATCH 1/8] feat(core,cli): update memory discovery; update settings
+ schema and config; update tests
+
+---
+ docs/releases.md                              |  2 +-
+ packages/cli/src/config/config.ts             |  1 +
+ packages/cli/src/config/settingsSchema.ts     | 10 +++++
+ .../src/ui/components/SuggestionsDisplay.tsx  |  2 +-
+ .../core/src/utils/memoryDiscovery.test.ts    | 44 +++++++++++++++++++
+ packages/core/src/utils/memoryDiscovery.ts    | 32 +++++++++++---
+ 6 files changed, 84 insertions(+), 7 deletions(-)
+
+diff --git a/docs/releases.md b/docs/releases.md
+index 78c2b0845f6..5741335b7a5 100644
+--- a/docs/releases.md
++++ b/docs/releases.md
+@@ -2,7 +2,7 @@
+ 
+ ## Release Cadence and Tags
+ 
+-We will follow https://semver.org/ as closely as possible but will call out when or if we have to deviate from it. Our weekly releases will be minor version increments and any bug or hotfixes btween releases will go out as patch versions on the most recent release.
++We will follow https://semver.org/ as closely as possible but will call out when or if we have to deviate from it. Our weekly releases will be minor version increments and any bug or hotfixes between releases will go out as patch versions on the most recent release.
+ 
+ ### Preview
+ 
+diff --git a/packages/cli/src/config/config.ts b/packages/cli/src/config/config.ts
+index 3d0ba230d7f..f308e4b9b6e 100755
+--- a/packages/cli/src/config/config.ts
++++ b/packages/cli/src/config/config.ts
+@@ -382,6 +382,7 @@ export async function loadHierarchicalGeminiMemory(
+     memoryImportFormat,
+     fileFilteringOptions,
+     settings.context?.discoveryMaxDirs,
++    settings.context?.fileFiltering?.currentDirectoryOnly === true,
+   );
+ }
+ 
+diff --git a/packages/cli/src/config/settingsSchema.ts b/packages/cli/src/config/settingsSchema.ts
+index e8c8032adde..f71aa6ddbab 100644
+--- a/packages/cli/src/config/settingsSchema.ts
++++ b/packages/cli/src/config/settingsSchema.ts
+@@ -579,6 +579,16 @@ const SETTINGS_SCHEMA = {
+         description: 'Settings for git-aware file filtering.',
+         showInDialog: false,
+         properties: {
++          currentDirectoryOnly: {
++            type: 'boolean',
++            label: 'Context From Current Directory Only',
++            category: 'Context',
++            requiresRestart: true,
++            default: false,
++            description:
++              'If enabled, load context only from the current directory (no upward/downward/global scans).',
++            showInDialog: true,
++          },
+           respectGitIgnore: {
+             type: 'boolean',
+             label: 'Respect .gitignore',
+diff --git a/packages/cli/src/ui/components/SuggestionsDisplay.tsx b/packages/cli/src/ui/components/SuggestionsDisplay.tsx
+index 3cbb689e241..ffd48713ec9 100644
+--- a/packages/cli/src/ui/components/SuggestionsDisplay.tsx
++++ b/packages/cli/src/ui/components/SuggestionsDisplay.tsx
+@@ -85,7 +85,7 @@ export function SuggestionsDisplay({
+               <Box>
+                 {labelElement}
+                 {suggestion.commandKind === CommandKind.MCP_PROMPT && (
+-                  <Text color={theme.text.secondary}> [MCP]</Text>
++                  <Text color={textColor}> [MCP]</Text>
+                 )}
+               </Box>
+             </Box>
+diff --git a/packages/core/src/utils/memoryDiscovery.test.ts b/packages/core/src/utils/memoryDiscovery.test.ts
+index 67b6d4936ee..8a5d747d040 100644
+--- a/packages/core/src/utils/memoryDiscovery.test.ts
++++ b/packages/core/src/utils/memoryDiscovery.test.ts
+@@ -228,6 +228,50 @@ describe('loadServerHierarchicalMemory', () => {
+     });
+   });
+ 
++  it('should load only from current directory when currentDirectoryOnly is true', async () => {
++    const customFilename = 'LOCAL_ONLY.md';
++    setGeminiMdFilename(customFilename);
++
++    // Create files in multiple locations
++    const cwdOnly = await createTestFile(
++      path.join(cwd, customFilename),
++      'CWD only memory',
++    );
++    await createTestFile(
++      path.join(projectRoot, customFilename),
++      'Parent memory - should be ignored',
++    );
++    await createTestFile(
++      path.join(cwd, 'sub', customFilename),
++      'Sub memory - should be ignored',
++    );
++    await createTestFile(
++      path.join(homedir, GEMINI_DIR, customFilename),
++      'Global memory - should be ignored',
++    );
++
++    const result = await loadServerHierarchicalMemory(
++      cwd,
++      [],
++      false,
++      new FileDiscoveryService(projectRoot),
++      [],
++      DEFAULT_FOLDER_TRUST,
++      'tree',
++      {
++        respectGitIgnore: true,
++        respectGeminiIgnore: true,
++      },
++      200,
++      true, // currentDirectoryOnly
++    );
++
++    expect(result).toEqual({
++      memoryContent: `--- Context from: ${path.relative(cwd, cwdOnly)} ---\nCWD only memory\n--- End of Context from: ${path.relative(cwd, cwdOnly)} ---`,
++      fileCount: 1,
++    });
++  });
++
+   it('should load ORIGINAL_GEMINI_MD_FILENAME files by upward traversal from CWD to project root', async () => {
+     const projectRootGeminiFile = await createTestFile(
+       path.join(projectRoot, DEFAULT_CONTEXT_FILENAME),
+diff --git a/packages/core/src/utils/memoryDiscovery.ts b/packages/core/src/utils/memoryDiscovery.ts
+index dc7ce0c22a0..8a2070f22c8 100644
+--- a/packages/core/src/utils/memoryDiscovery.ts
++++ b/packages/core/src/utils/memoryDiscovery.ts
+@@ -88,11 +88,13 @@ async function getGeminiMdFilePathsInternal(
+   folderTrust: boolean,
+   fileFilteringOptions: FileFilteringOptions,
+   maxDirs: number,
++  currentDirectoryOnly: boolean = false,
+ ): Promise<string[]> {
+-  const dirs = new Set<string>([
+-    ...includeDirectoriesToReadGemini,
+-    currentWorkingDirectory,
+-  ]);
++  const dirs = new Set<string>(
++    currentDirectoryOnly
++      ? [currentWorkingDirectory]
++      : [...includeDirectoriesToReadGemini, currentWorkingDirectory],
++  );
+ 
+   // Process directories in parallel with concurrency limit to prevent EMFILE errors
+   const CONCURRENT_LIMIT = 10;
+@@ -107,10 +109,11 @@ async function getGeminiMdFilePathsInternal(
+         userHomePath,
+         debugMode,
+         fileService,
+-        extensionContextFilePaths,
++        currentDirectoryOnly ? [] : extensionContextFilePaths,
+         folderTrust,
+         fileFilteringOptions,
+         maxDirs,
++        currentDirectoryOnly,
+       ),
+     );
+ 
+@@ -141,11 +144,28 @@ async function getGeminiMdFilePathsInternalForEachDir(
+   folderTrust: boolean,
+   fileFilteringOptions: FileFilteringOptions,
+   maxDirs: number,
++  currentDirectoryOnly: boolean = false,
+ ): Promise<string[]> {
+   const allPaths = new Set<string>();
+   const geminiMdFilenames = getAllGeminiMdFilenames();
+ 
+   for (const geminiMdFilename of geminiMdFilenames) {
++    if (currentDirectoryOnly) {
++      // Only consider the file in the current directory.
++      const candidate = path.join(path.resolve(dir), geminiMdFilename);
++      try {
++        await fs.access(candidate, fsSync.constants.R_OK);
++        allPaths.add(candidate);
++        if (debugMode)
++          logger.debug(
++            `currentDirectoryOnly: Found ${geminiMdFilename} in CWD: ${candidate}`,
++          );
++      } catch {
++        // not found in CWD, silently ignore
++      }
++      continue; // Skip global/upward/downward/ext when currentDirectoryOnly
++    }
++
+     const resolvedHome = path.resolve(userHomePath);
+     const globalMemoryPath = path.join(
+       resolvedHome,
+@@ -347,6 +367,7 @@ export async function loadServerHierarchicalMemory(
+   importFormat: 'flat' | 'tree' = 'tree',
+   fileFilteringOptions?: FileFilteringOptions,
+   maxDirs: number = 200,
++  currentDirectoryOnly: boolean = false,
+ ): Promise<LoadServerHierarchicalMemoryResponse> {
+   if (debugMode)
+     logger.debug(
+@@ -366,6 +387,7 @@ export async function loadServerHierarchicalMemory(
+     folderTrust,
+     fileFilteringOptions || DEFAULT_MEMORY_FILE_FILTERING_OPTIONS,
+     maxDirs,
++    currentDirectoryOnly,
+   );
+   if (filePaths.length === 0) {
+     if (debugMode)
+
+From a7996cc6d4c3d89b99afef450855a183b47d4aa3 Mon Sep 17 00:00:00 2001
+From: Alexander Efimov <Alexandr.Efimov@gmail.com>
+Date: Fri, 12 Sep 2025 18:01:02 +0500
+Subject: [PATCH 2/8] test(cli): adjust loadServerHierarchicalMemory call
+ expectation for new args
+
+---
+ packages/cli/src/config/config.test.ts | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/packages/cli/src/config/config.test.ts b/packages/cli/src/config/config.test.ts
+index 82966d47ed7..a0018d539c1 100644
+--- a/packages/cli/src/config/config.test.ts
++++ b/packages/cli/src/config/config.test.ts
+@@ -722,6 +722,7 @@ describe('Hierarchical Memory Loading (config.ts) - Placeholder Suite', () => {
+         respectGeminiIgnore: true,
+       },
+       undefined, // maxDirs
++      false,
+     );
+   });
+ 
+
+From c4e451beec8e14ac89e2056db9b2daa5d4b63829 Mon Sep 17 00:00:00 2001
+From: Alexander Efimov <Alexandr.Efimov@gmail.com>
+Date: Fri, 12 Sep 2025 18:13:05 +0500
+Subject: [PATCH 3/8] fix(core): remove fs.access TOCTOU check; defer
+ validation to read step
+
+---
+ packages/core/src/utils/memoryDiscovery.ts | 17 +++++++----------
+ 1 file changed, 7 insertions(+), 10 deletions(-)
+
+diff --git a/packages/core/src/utils/memoryDiscovery.ts b/packages/core/src/utils/memoryDiscovery.ts
+index 8a2070f22c8..47b84939e54 100644
+--- a/packages/core/src/utils/memoryDiscovery.ts
++++ b/packages/core/src/utils/memoryDiscovery.ts
+@@ -153,16 +153,13 @@ async function getGeminiMdFilePathsInternalForEachDir(
+     if (currentDirectoryOnly) {
+       // Only consider the file in the current directory.
+       const candidate = path.join(path.resolve(dir), geminiMdFilename);
+-      try {
+-        await fs.access(candidate, fsSync.constants.R_OK);
+-        allPaths.add(candidate);
+-        if (debugMode)
+-          logger.debug(
+-            `currentDirectoryOnly: Found ${geminiMdFilename} in CWD: ${candidate}`,
+-          );
+-      } catch {
+-        // not found in CWD, silently ignore
+-      }
++      // Avoid TOCTOU: don't check access here; defer to readGeminiMdFiles which
++      // handles errors gracefully. Just add the candidate and log.
++      allPaths.add(candidate);
++      if (debugMode)
++        logger.debug(
++          `currentDirectoryOnly: Added candidate ${geminiMdFilename} in CWD: ${candidate}`,
++        );
+       continue; // Skip global/upward/downward/ext when currentDirectoryOnly
+     }
+ 
+
+From 22e59bd34b6504652aaf1633c0e5791449d75e56 Mon Sep 17 00:00:00 2001
+From: Alexander Efimov <Alexandr.Efimov@gmail.com>
+Date: Fri, 12 Sep 2025 22:25:41 +0500
+Subject: [PATCH 4/8] refactor(core): move currentDirectoryOnly check inside
+ getGeminiMdFilePathsInternalForEachDir
+
+- Makes the function more self-contained and reduces coupling
+- Addresses review feedback about making the logic more robust
+- Extension context files are now filtered inside the function itself
+---
+ packages/core/src/utils/memoryDiscovery.ts | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/packages/core/src/utils/memoryDiscovery.ts b/packages/core/src/utils/memoryDiscovery.ts
+index 47b84939e54..ff87f4ff8a4 100644
+--- a/packages/core/src/utils/memoryDiscovery.ts
++++ b/packages/core/src/utils/memoryDiscovery.ts
+@@ -109,7 +109,7 @@ async function getGeminiMdFilePathsInternal(
+         userHomePath,
+         debugMode,
+         fileService,
+-        currentDirectoryOnly ? [] : extensionContextFilePaths,
++        extensionContextFilePaths,
+         folderTrust,
+         fileFilteringOptions,
+         maxDirs,
+@@ -243,9 +243,11 @@ async function getGeminiMdFilePathsInternalForEachDir(
+     }
+   }
+ 
+-  // Add extension context file paths.
+-  for (const extensionPath of extensionContextFilePaths) {
+-    allPaths.add(extensionPath);
++  // Add extension context file paths only if not in currentDirectoryOnly mode.
++  if (!currentDirectoryOnly) {
++    for (const extensionPath of extensionContextFilePaths) {
++      allPaths.add(extensionPath);
++    }
+   }
+ 
+   const finalPaths = Array.from(allPaths);
+
+From 079b5c093c25976b423676f4c1755e76512ddc0e Mon Sep 17 00:00:00 2001
+From: Alexander Efimov <Alexandr.Efimov@gmail.com>
+Date: Fri, 12 Sep 2025 22:42:49 +0500
+Subject: [PATCH 5/8] fix(core): apply fileFilteringOptions to
+ currentDirectoryOnly mode
+
+- Add shouldIgnoreFile check for currentDirectoryOnly candidates
+- Ensures .gitignore and other filter rules are respected
+- Prevents ignored files from being included in context
+- Addresses review feedback about missing file filtering
+---
+ packages/core/src/utils/memoryDiscovery.ts | 24 +++++++++++++++-------
+ 1 file changed, 17 insertions(+), 7 deletions(-)
+
+diff --git a/packages/core/src/utils/memoryDiscovery.ts b/packages/core/src/utils/memoryDiscovery.ts
+index ff87f4ff8a4..7406fa88cfd 100644
+--- a/packages/core/src/utils/memoryDiscovery.ts
++++ b/packages/core/src/utils/memoryDiscovery.ts
+@@ -153,13 +153,23 @@ async function getGeminiMdFilePathsInternalForEachDir(
+     if (currentDirectoryOnly) {
+       // Only consider the file in the current directory.
+       const candidate = path.join(path.resolve(dir), geminiMdFilename);
+-      // Avoid TOCTOU: don't check access here; defer to readGeminiMdFiles which
+-      // handles errors gracefully. Just add the candidate and log.
+-      allPaths.add(candidate);
+-      if (debugMode)
+-        logger.debug(
+-          `currentDirectoryOnly: Added candidate ${geminiMdFilename} in CWD: ${candidate}`,
+-        );
++      // Apply file filtering options (e.g., respectGitIgnore) before adding
++      if (fileService.shouldIgnoreFile(candidate, fileFilteringOptions)) {
++        if (debugMode) {
++          logger.debug(
++            `currentDirectoryOnly: Ignoring candidate ${candidate} due to filter rules.`,
++          );
++        }
++      } else {
++        // Avoid TOCTOU: don't check access here; defer to readGeminiMdFiles which
++        // handles errors gracefully. Just add the candidate and log.
++        allPaths.add(candidate);
++        if (debugMode) {
++          logger.debug(
++            `currentDirectoryOnly: Added candidate ${geminiMdFilename} in CWD: ${candidate}`,
++          );
++        }
++      }
+       continue; // Skip global/upward/downward/ext when currentDirectoryOnly
+     }
+ 
+
+From 9ef04649c66e5cd2359d45b1fd25d8d70af909a9 Mon Sep 17 00:00:00 2001
+From: Alexander Efimov <Alexandr.Efimov@gmail.com>
+Date: Fri, 12 Sep 2025 22:51:39 +0500
+Subject: [PATCH 6/8] fix(core): handle edge case when currentDirectoryOnly is
+ true and user is in home directory
+
+- Use userHomePath as fallback when currentWorkingDirectory is empty string
+- Prevents loading context from incorrect location when user is in home dir
+- Addresses review feedback about potential bug in currentDirectoryOnly mode
+---
+ packages/core/src/utils/memoryDiscovery.ts | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/packages/core/src/utils/memoryDiscovery.ts b/packages/core/src/utils/memoryDiscovery.ts
+index 7406fa88cfd..23e9d3d17c4 100644
+--- a/packages/core/src/utils/memoryDiscovery.ts
++++ b/packages/core/src/utils/memoryDiscovery.ts
+@@ -92,7 +92,7 @@ async function getGeminiMdFilePathsInternal(
+ ): Promise<string[]> {
+   const dirs = new Set<string>(
+     currentDirectoryOnly
+-      ? [currentWorkingDirectory]
++      ? [currentWorkingDirectory || userHomePath]
+       : [...includeDirectoriesToReadGemini, currentWorkingDirectory],
+   );
+ 
+
+From b3cd1e03eaa6aab2db72d6e14c1d6a8537ecc10d Mon Sep 17 00:00:00 2001
+From: Alexander Efimov <Alexandr.Efimov@gmail.com>
+Date: Fri, 12 Sep 2025 23:11:59 +0500
+Subject: [PATCH 7/8] refactor(core,cli): move home directory logic to CLI;
+ core always receives valid cwd
+
+- CLI now determines the correct directory to scan and always passes a valid path to core
+- Core utility no longer interprets empty string as home, improving abstraction and reusability
+- Addresses review feedback about leaky abstraction and implicit contract between layers
+---
+ packages/cli/src/config/config.ts          | 12 ++++++++----
+ packages/core/src/utils/memoryDiscovery.ts |  2 +-
+ 2 files changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/packages/cli/src/config/config.ts b/packages/cli/src/config/config.ts
+index f308e4b9b6e..ab1b34a6d6d 100755
+--- a/packages/cli/src/config/config.ts
++++ b/packages/cli/src/config/config.ts
+@@ -361,9 +361,13 @@ export async function loadHierarchicalGeminiMemory(
+   const realHome = fs.realpathSync(path.resolve(homedir()));
+   const isHomeDirectory = realCwd === realHome;
+ 
+-  // If it is the home directory, pass an empty string to the core memory
+-  // function to signal that it should skip the workspace search.
+-  const effectiveCwd = isHomeDirectory ? '' : currentWorkingDirectory;
++  // If currentDirectoryOnly and we are in home, explicitly use home as cwd.
++  const currentDirectoryOnly =
++    settings.context?.fileFiltering?.currentDirectoryOnly === true;
++  const effectiveCwd =
++    currentDirectoryOnly && isHomeDirectory
++      ? realHome
++      : currentWorkingDirectory;
+ 
+   if (debugMode) {
+     logger.debug(
+@@ -382,7 +386,7 @@ export async function loadHierarchicalGeminiMemory(
+     memoryImportFormat,
+     fileFilteringOptions,
+     settings.context?.discoveryMaxDirs,
+-    settings.context?.fileFiltering?.currentDirectoryOnly === true,
++    currentDirectoryOnly,
+   );
+ }
+ 
+diff --git a/packages/core/src/utils/memoryDiscovery.ts b/packages/core/src/utils/memoryDiscovery.ts
+index 23e9d3d17c4..7406fa88cfd 100644
+--- a/packages/core/src/utils/memoryDiscovery.ts
++++ b/packages/core/src/utils/memoryDiscovery.ts
+@@ -92,7 +92,7 @@ async function getGeminiMdFilePathsInternal(
+ ): Promise<string[]> {
+   const dirs = new Set<string>(
+     currentDirectoryOnly
+-      ? [currentWorkingDirectory || userHomePath]
++      ? [currentWorkingDirectory]
+       : [...includeDirectoriesToReadGemini, currentWorkingDirectory],
+   );
+ 
+
+From 63059869bdd269177750663043ea0c59913977ff Mon Sep 17 00:00:00 2001
+From: Alexander Efimov <Alexandr.Efimov@gmail.com>
+Date: Fri, 12 Sep 2025 23:24:34 +0500
+Subject: [PATCH 8/8] fix(cli): restore skip-home workspace scan logic for
+ memory discovery
+
+- If not currentDirectoryOnly and in home, pass empty string to core to skip workspace scan
+- If currentDirectoryOnly, always pass cwd (or home)
+- Addresses regression reported in review: prevents slow full scan from home directory
+---
+ packages/cli/src/config/config.ts | 6 ++----
+ 1 file changed, 2 insertions(+), 4 deletions(-)
+
+diff --git a/packages/cli/src/config/config.ts b/packages/cli/src/config/config.ts
+index ab1b34a6d6d..8d7ec91802f 100755
+--- a/packages/cli/src/config/config.ts
++++ b/packages/cli/src/config/config.ts
+@@ -361,13 +361,11 @@ export async function loadHierarchicalGeminiMemory(
+   const realHome = fs.realpathSync(path.resolve(homedir()));
+   const isHomeDirectory = realCwd === realHome;
+ 
+-  // If currentDirectoryOnly and we are in home, explicitly use home as cwd.
++  // If not currentDirectoryOnly and in home, pass empty string to skip workspace scan; otherwise, pass cwd.
+   const currentDirectoryOnly =
+     settings.context?.fileFiltering?.currentDirectoryOnly === true;
+   const effectiveCwd =
+-    currentDirectoryOnly && isHomeDirectory
+-      ? realHome
+-      : currentWorkingDirectory;
++    !currentDirectoryOnly && isHomeDirectory ? '' : currentWorkingDirectory;
+ 
+   if (debugMode) {
+     logger.debug(

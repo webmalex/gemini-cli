@@ -1,0 +1,222 @@
+From bad0c1516a29afca9c477fb0d2b573ee60933d61 Mon Sep 17 00:00:00 2001
+From: Alexander Efimov <Alexandr.Efimov@gmail.com>
+Date: Mon, 15 Sep 2025 13:34:59 +0500
+Subject: [PATCH] feat: should only load memory from current directory when
+ currentDirectoryOnly is true (default)
+
+
+diff --git a/packages/cli/src/config/config.test.ts b/packages/cli/src/config/config.test.ts
+index 4de0c8a5..d4fb1da0 100644
+--- a/packages/cli/src/config/config.test.ts
++++ b/packages/cli/src/config/config.test.ts
+@@ -728,6 +728,7 @@ describe('Hierarchical Memory Loading (config.ts) - Placeholder Suite', () => {
+         respectGeminiIgnore: true,
+       },
+       undefined, // maxDirs
++      false,
+     );
+   });
+ 
+diff --git a/packages/cli/src/config/config.ts b/packages/cli/src/config/config.ts
+index 440c923a..34d662f6 100755
+--- a/packages/cli/src/config/config.ts
++++ b/packages/cli/src/config/config.ts
+@@ -361,9 +361,11 @@ export async function loadHierarchicalGeminiMemory(
+   const realHome = fs.realpathSync(path.resolve(homedir()));
+   const isHomeDirectory = realCwd === realHome;
+ 
+-  // If it is the home directory, pass an empty string to the core memory
+-  // function to signal that it should skip the workspace search.
+-  const effectiveCwd = isHomeDirectory ? '' : currentWorkingDirectory;
++  // If not currentDirectoryOnly and in home, pass empty string to skip workspace scan; otherwise, pass cwd.
++  const currentDirectoryOnly =
++    settings.context?.fileFiltering?.currentDirectoryOnly === true;
++  const effectiveCwd =
++    !currentDirectoryOnly && isHomeDirectory ? '' : currentWorkingDirectory;
+ 
+   if (debugMode) {
+     logger.debug(
+@@ -382,6 +384,7 @@ export async function loadHierarchicalGeminiMemory(
+     memoryImportFormat,
+     fileFilteringOptions,
+     settings.context?.discoveryMaxDirs,
++    currentDirectoryOnly,
+   );
+ }
+ 
+diff --git a/packages/cli/src/config/settingsSchema.ts b/packages/cli/src/config/settingsSchema.ts
+index 4a4b3902..d63fcc94 100644
+--- a/packages/cli/src/config/settingsSchema.ts
++++ b/packages/cli/src/config/settingsSchema.ts
+@@ -579,6 +579,16 @@ const SETTINGS_SCHEMA = {
+         description: 'Settings for git-aware file filtering.',
+         showInDialog: false,
+         properties: {
++          currentDirectoryOnly: {
++            type: 'boolean',
++            label: 'Context From Current Directory Only',
++            category: 'Context',
++            requiresRestart: true,
++            default: false,
++            description:
++              'If enabled, load context only from the current directory (no upward/downward/global scans).',
++            showInDialog: true,
++          },
+           respectGitIgnore: {
+             type: 'boolean',
+             label: 'Respect .gitignore',
+diff --git a/packages/core/src/utils/memoryDiscovery.test.ts b/packages/core/src/utils/memoryDiscovery.test.ts
+index 67b6d493..8a5d747d 100644
+--- a/packages/core/src/utils/memoryDiscovery.test.ts
++++ b/packages/core/src/utils/memoryDiscovery.test.ts
+@@ -228,6 +228,50 @@ describe('loadServerHierarchicalMemory', () => {
+     });
+   });
+ 
++  it('should load only from current directory when currentDirectoryOnly is true', async () => {
++    const customFilename = 'LOCAL_ONLY.md';
++    setGeminiMdFilename(customFilename);
++
++    // Create files in multiple locations
++    const cwdOnly = await createTestFile(
++      path.join(cwd, customFilename),
++      'CWD only memory',
++    );
++    await createTestFile(
++      path.join(projectRoot, customFilename),
++      'Parent memory - should be ignored',
++    );
++    await createTestFile(
++      path.join(cwd, 'sub', customFilename),
++      'Sub memory - should be ignored',
++    );
++    await createTestFile(
++      path.join(homedir, GEMINI_DIR, customFilename),
++      'Global memory - should be ignored',
++    );
++
++    const result = await loadServerHierarchicalMemory(
++      cwd,
++      [],
++      false,
++      new FileDiscoveryService(projectRoot),
++      [],
++      DEFAULT_FOLDER_TRUST,
++      'tree',
++      {
++        respectGitIgnore: true,
++        respectGeminiIgnore: true,
++      },
++      200,
++      true, // currentDirectoryOnly
++    );
++
++    expect(result).toEqual({
++      memoryContent: `--- Context from: ${path.relative(cwd, cwdOnly)} ---\nCWD only memory\n--- End of Context from: ${path.relative(cwd, cwdOnly)} ---`,
++      fileCount: 1,
++    });
++  });
++
+   it('should load ORIGINAL_GEMINI_MD_FILENAME files by upward traversal from CWD to project root', async () => {
+     const projectRootGeminiFile = await createTestFile(
+       path.join(projectRoot, DEFAULT_CONTEXT_FILENAME),
+diff --git a/packages/core/src/utils/memoryDiscovery.ts b/packages/core/src/utils/memoryDiscovery.ts
+index dc7ce0c2..7406fa88 100644
+--- a/packages/core/src/utils/memoryDiscovery.ts
++++ b/packages/core/src/utils/memoryDiscovery.ts
+@@ -88,11 +88,13 @@ async function getGeminiMdFilePathsInternal(
+   folderTrust: boolean,
+   fileFilteringOptions: FileFilteringOptions,
+   maxDirs: number,
++  currentDirectoryOnly: boolean = false,
+ ): Promise<string[]> {
+-  const dirs = new Set<string>([
+-    ...includeDirectoriesToReadGemini,
+-    currentWorkingDirectory,
+-  ]);
++  const dirs = new Set<string>(
++    currentDirectoryOnly
++      ? [currentWorkingDirectory]
++      : [...includeDirectoriesToReadGemini, currentWorkingDirectory],
++  );
+ 
+   // Process directories in parallel with concurrency limit to prevent EMFILE errors
+   const CONCURRENT_LIMIT = 10;
+@@ -111,6 +113,7 @@ async function getGeminiMdFilePathsInternal(
+         folderTrust,
+         fileFilteringOptions,
+         maxDirs,
++        currentDirectoryOnly,
+       ),
+     );
+ 
+@@ -141,11 +144,35 @@ async function getGeminiMdFilePathsInternalForEachDir(
+   folderTrust: boolean,
+   fileFilteringOptions: FileFilteringOptions,
+   maxDirs: number,
++  currentDirectoryOnly: boolean = false,
+ ): Promise<string[]> {
+   const allPaths = new Set<string>();
+   const geminiMdFilenames = getAllGeminiMdFilenames();
+ 
+   for (const geminiMdFilename of geminiMdFilenames) {
++    if (currentDirectoryOnly) {
++      // Only consider the file in the current directory.
++      const candidate = path.join(path.resolve(dir), geminiMdFilename);
++      // Apply file filtering options (e.g., respectGitIgnore) before adding
++      if (fileService.shouldIgnoreFile(candidate, fileFilteringOptions)) {
++        if (debugMode) {
++          logger.debug(
++            `currentDirectoryOnly: Ignoring candidate ${candidate} due to filter rules.`,
++          );
++        }
++      } else {
++        // Avoid TOCTOU: don't check access here; defer to readGeminiMdFiles which
++        // handles errors gracefully. Just add the candidate and log.
++        allPaths.add(candidate);
++        if (debugMode) {
++          logger.debug(
++            `currentDirectoryOnly: Added candidate ${geminiMdFilename} in CWD: ${candidate}`,
++          );
++        }
++      }
++      continue; // Skip global/upward/downward/ext when currentDirectoryOnly
++    }
++
+     const resolvedHome = path.resolve(userHomePath);
+     const globalMemoryPath = path.join(
+       resolvedHome,
+@@ -226,9 +253,11 @@ async function getGeminiMdFilePathsInternalForEachDir(
+     }
+   }
+ 
+-  // Add extension context file paths.
+-  for (const extensionPath of extensionContextFilePaths) {
+-    allPaths.add(extensionPath);
++  // Add extension context file paths only if not in currentDirectoryOnly mode.
++  if (!currentDirectoryOnly) {
++    for (const extensionPath of extensionContextFilePaths) {
++      allPaths.add(extensionPath);
++    }
+   }
+ 
+   const finalPaths = Array.from(allPaths);
+@@ -347,6 +376,7 @@ export async function loadServerHierarchicalMemory(
+   importFormat: 'flat' | 'tree' = 'tree',
+   fileFilteringOptions?: FileFilteringOptions,
+   maxDirs: number = 200,
++  currentDirectoryOnly: boolean = false,
+ ): Promise<LoadServerHierarchicalMemoryResponse> {
+   if (debugMode)
+     logger.debug(
+@@ -366,6 +396,7 @@ export async function loadServerHierarchicalMemory(
+     folderTrust,
+     fileFilteringOptions || DEFAULT_MEMORY_FILE_FILTERING_OPTIONS,
+     maxDirs,
++    currentDirectoryOnly,
+   );
+   if (filePaths.length === 0) {
+     if (debugMode)
+-- 
+2.51.0
+
